@@ -1,0 +1,556 @@
+#pragma kernel regression
+
+cbuffer PerFrameCB
+{
+    uint frameNumber;
+	int screen_width;
+	int screen_height;
+	int horizontal_blocks_count;
+    int _debugFloat;
+};
+
+Texture2D<float4> gCurPos; //world position
+Texture2D<float4> gCurNorm; //world normal
+Texture2D<float4> albedo;
+Texture2D<uint> gInvalidatePrevFrame;
+
+RWTexture2D<float> tmp_data;// BLOCK_PIXELS * [(FEATURES_COUNT + color_channels) * blocks]  <-- blocks = w*h
+RWTexture2D<float> out_data;// where we perform QR decomposition
+RWTexture2D<float4> gCurNoisy; //current noisy image
+
+groupshared float sum_vec[256];
+groupshared float uVec[1024];
+groupshared float gchannel[1024];
+groupshared float bchannel[1024];
+groupshared float rmat[10][13]; // FEATURES * BUFFER_COUNT
+groupshared float u_length_squared;
+groupshared float dotV;
+groupshared float block_min;
+groupshared float block_max;
+groupshared float vec_length;
+
+#define BUFFER_COUNT 13
+#define FEATURES_COUNT 10
+#define FEATURES_NOT_SCALED 4
+#define BLOCK_PIXELS 1024
+#define LOCAL_SIZE 256
+#define BLOCK_EDGE_LENGTH 32
+#define NOISE_AMOUNT 0.01
+#define BLOCK_OFFSETS_COUNT 16
+
+// #define INBLOCK_ID sub_vector * LOCAL_SIZE + groupThreadId
+// X -> 0..3
+// groupThreadId -> 0 .. 255 //(w*h)
+
+// [0] -> 0 .. 1023
+// [1] -> 
+#define INBLOCK_ID(X) ((X) * LOCAL_SIZE + groupThreadId)
+// #define INBLOCK_ID_UNITY_TEXTURE_HACK(X) ((X) * LOCAL_SIZE + groupThreadId + 1024*int(groupId.x/1050))
+#define INBLOCK_ID_UNITY_TEXTURE_HACK(X) ((X) * LOCAL_SIZE + groupThreadId)
+#define BLOCK_OFFSET groupId.x * BUFFER_COUNT
+// #define BLOCK_OFFSET_UNITY_TEXTURE_HACK groupId.x * BUFFER_COUNT - (1050*13)*int(groupId.x/1050)
+#define BLOCK_OFFSET_UNITY_TEXTURE_HACK groupId.x * BUFFER_COUNT
+
+
+static const int2 BLOCK_OFFSETS[BLOCK_OFFSETS_COUNT] =
+{
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+	// int2(0,0),
+    //TODO: DELETE ABOVE, UNCOMMENT UNDER
+	int2(-30, -30),
+	int2(-12, -22),
+	int2(-24, -2),
+	int2(-8, -16),
+	int2(-26, -24),
+	int2(-14, -4),
+	int2(-4, -28),
+	int2(-26, -16),
+	int2(-4, -2),
+	int2(-24, -32),
+	int2(-10, -10),
+	int2(-18, -18),
+	int2(-12, -30),
+	int2(-32, -4),
+	int2(-2, -20),
+	int2(-22, -12),
+};
+
+static inline int mirror(int index, int size)
+{
+	if (index < 0)
+		index = abs(index) - 1;
+	else if (index >= size)
+        //TODO: revisar qué pasa si es 3x size
+		index = 2 * size - index - 1;
+
+	return index;
+}
+
+static inline int2 mirror2(int2 index, int2 size)
+{
+	index.x = mirror(index.x, size.x);
+	index.y = mirror(index.y, size.y);
+
+	return index;
+}
+
+static inline float random(uint a) {
+   a = (a+0x7ed55d16) + (a<<12);
+   a = (a^0xc761c23c) ^ (a>>19);
+   a = (a+0x165667b1) + (a<<5);
+   a = (a+0xd3a2646c) ^ (a<<9);
+   a = (a+0xfd7046c5) + (a<<3);
+   a = (a^0xb55a4f09) ^ (a>>16);
+
+   return float(a) / 4294967296.0f;
+}
+
+static inline float add_random(
+      const float value,
+      const int id,
+      const int sub_vector,
+      const int feature_buffer,
+      const int frame_number){
+   return value + NOISE_AMOUNT * 2 * (random(id + sub_vector * LOCAL_SIZE +
+      feature_buffer * BLOCK_EDGE_LENGTH * BLOCK_EDGE_LENGTH +
+      frame_number * BUFFER_COUNT * BLOCK_EDGE_LENGTH * BLOCK_EDGE_LENGTH) - 0.5f);
+}
+
+[numthreads(256, 1, 1)] // LOCAL_SIZE
+// groupThreadId -> 0..255
+// groupId -> 0 .. 1049 // 0 .. 2135
+void regression(uint3 groupId : SV_GroupID, uint groupThreadId : SV_GroupIndex)
+{
+	// load features and colors to tmp_data
+	for (uint sub_vector_1 = 0; sub_vector_1 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_1) {
+		uint index = INBLOCK_ID(sub_vector_1);
+        int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_1);
+		int2 uv = int2(groupId.x % horizontal_blocks_count, groupId.x / horizontal_blocks_count);
+		uv *= BLOCK_EDGE_LENGTH;
+		uv += int2(index % BLOCK_EDGE_LENGTH, index / BLOCK_EDGE_LENGTH);
+		uv += BLOCK_OFFSETS[frameNumber % BLOCK_OFFSETS_COUNT];
+		// uv = mirror2(uv, int2(screen_width, screen_height));
+        // uv.x = mirror(uv.x, screen_width);
+        // uv.y = mirror(-uv.y+545, screen_height);
+
+		tmp_data[uint2(index_hacked, 0 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = 1.0f;
+        tmp_data[uint2(index_hacked, 1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurNorm[uv].x;
+        tmp_data[uint2(index_hacked, 2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurNorm[uv].y;
+        tmp_data[uint2(index_hacked, 3 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurNorm[uv].z;
+        tmp_data[uint2(index_hacked, 4 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].x;
+        tmp_data[uint2(index_hacked, 5 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].y;
+        tmp_data[uint2(index_hacked, 6 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].z;
+        tmp_data[uint2(index_hacked, 7 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].x * gCurPos[uv].x;
+        tmp_data[uint2(index_hacked, 8 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].y * gCurPos[uv].y;
+        tmp_data[uint2(index_hacked, 9 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = gCurPos[uv].z * gCurPos[uv].z;
+		tmp_data[uint2(index_hacked, 10 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = albedo[uv].x < 0.01f ? 0.0f : gCurNoisy[uv].x / albedo[uv].x;
+		tmp_data[uint2(index_hacked, 11 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = albedo[uv].y < 0.01f ? 0.0f : gCurNoisy[uv].y / albedo[uv].y;
+		tmp_data[uint2(index_hacked, 12 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = albedo[uv].z < 0.01f ? 0.0f : gCurNoisy[uv].z / albedo[uv].z;
+
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+    for(uint feature_buffer1 = FEATURES_NOT_SCALED; feature_buffer1 < FEATURES_COUNT; ++feature_buffer1) {
+        uint sub_vector_2 = 0;
+        float tmp_max = tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_2), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+        float tmp_min = tmp_max;
+        for(++sub_vector_2; sub_vector_2 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_2) {
+            float value = tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_2), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+            tmp_max = max(value, tmp_max);
+            tmp_min = min(value, tmp_min);
+        }
+        sum_vec[groupThreadId] = tmp_max;
+        GroupMemoryBarrierWithGroupSync();
+        
+        // parallel reduction find max
+        if(groupThreadId < 128) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 128]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 64) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 64]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 32) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 32]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 16) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 16]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 8) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 8]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 4) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 4]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 2) sum_vec[groupThreadId] = max(sum_vec[groupThreadId], sum_vec[groupThreadId + 2]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId == 0) block_max = max(sum_vec[0], sum_vec[1]);
+        GroupMemoryBarrierWithGroupSync(); 
+
+        sum_vec[groupThreadId] = tmp_min;
+        GroupMemoryBarrierWithGroupSync();
+        
+        // parallel reduction find min
+        if(groupThreadId < 128) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 128]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 64) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 64]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 32) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 32]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 16) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 16]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 8) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 8]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 4) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 4]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 2) sum_vec[groupThreadId] = min(sum_vec[groupThreadId], sum_vec[groupThreadId + 2]);
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId == 0) block_min = min(sum_vec[0], sum_vec[1]);
+		GroupMemoryBarrierWithGroupSync();
+
+        // normalize feature
+        if(block_max - block_min > 1.0f) {
+            for(uint sub_vector_3 = 0; sub_vector_3 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_3) {
+				out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_3), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = (tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_3), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] - block_min) / (block_max - block_min);
+                tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_3), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_3), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+            }
+        } else {
+            for(uint sub_vector_4 = 0; sub_vector_4 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_4) {
+                out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_4), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_4), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] - block_min;
+                tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_4), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_4), feature_buffer1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+            }
+        }
+    }
+
+    // copy noise colors to out
+    for(uint feature_buffer2 = FEATURES_COUNT; feature_buffer2 < BUFFER_COUNT; ++feature_buffer2) {
+        for(uint sub_vector_5 = 0; sub_vector_5 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_5) {
+            out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_5), feature_buffer2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_5), feature_buffer2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+        }
+    }
+    // copy not scaled features to out
+    for(uint feature_buffer3 = 0; feature_buffer3 < FEATURES_NOT_SCALED; ++feature_buffer3) {
+        for(uint sub_vector_6 = 0; sub_vector_6 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_6) {
+            out_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_6), feature_buffer3 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = tmp_data[uint2(INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_6), feature_buffer3 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Householder QR decomposition
+#ifdef IGNORE_LD_fEATURES
+	int limit = 0;
+    for(uint col_1 = 0; col_1 < FEATURES_COUNT; col_1++) {
+        float tmp_sum_value = 0;
+        for(uint sub_vector_7 = 0; sub_vector_7 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_7) {
+			int index = INBLOCK_ID(sub_vector_7);
+            int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_10);
+            float tmp = out_data[uint2(index_hacked, col_1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+            uVec[index] = tmp;
+            if(index >= limit + 1) {
+                tmp_sum_value += tmp * tmp;
+            }
+        }
+        sum_vec[groupThreadId] = tmp_sum_value;
+        GroupMemoryBarrierWithGroupSync();
+
+        // parallel reduction sum
+        if(groupThreadId < 128) sum_vec[groupThreadId] += sum_vec[groupThreadId + 128];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 64) sum_vec[groupThreadId] += sum_vec[groupThreadId + 64];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 32) sum_vec[groupThreadId] +=sum_vec[groupThreadId + 32];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 16) sum_vec[groupThreadId] += sum_vec[groupThreadId + 16];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 8) sum_vec[groupThreadId] += sum_vec[groupThreadId + 8];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 4) sum_vec[groupThreadId] += sum_vec[groupThreadId + 4];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 2) sum_vec[groupThreadId] += sum_vec[groupThreadId + 2];
+        GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId == 0) vec_length = sum_vec[0] + sum_vec[1];
+        GroupMemoryBarrierWithGroupSync();
+   
+        float r_value;
+        if(groupThreadId < limit) {
+            r_value = uVec[groupThreadId];
+        } else if(groupThreadId == limit) {
+			u_length_squared = vec_length;
+			vec_length = sqrt(vec_length + uVec[limit] * uVec[limit]);
+			uVec[limit] -= vec_length;
+			u_length_squared += uVec[limit] * uVec[limit];
+			r_value = vec_length;
+        } else if(groupThreadId > limit) {
+            r_value = 0;
+        }
+
+		GroupMemoryBarrierWithGroupSync();
+		if (vec_length > 0.01f) {
+			limit++;
+			if (groupThreadId < FEATURES_COUNT)
+				rmat[groupThreadId][col_1] = r_value;
+		}
+		else {
+			if (groupThreadId < FEATURES_COUNT)
+				rmat[groupThreadId][col_1] = 0.0f;
+			continue;
+		}
+
+		if (u_length_squared < 0.001f) {
+			continue;
+		}
+
+        for(uint feature_buffer = col_1 + 1; feature_buffer < BUFFER_COUNT; feature_buffer++) {
+            float tmp_data_private_cache[BLOCK_PIXELS / LOCAL_SIZE];
+            float tmp_sum_value = 0.0f;
+            for(uint sub_vector_8 = 0; sub_vector_8 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_8) {
+                int index = INBLOCK_ID(sub_vector_8);
+                int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_8);
+                if(index >= limit - 1) {
+                    float tmp = out_data[uint2(index_hacked, feature_buffer + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+                    tmp_data_private_cache[sub_vector_8] = tmp;
+                    tmp_sum_value += tmp * uVec[index];
+                }
+            }
+
+            sum_vec[groupThreadId] = tmp_sum_value;
+            GroupMemoryBarrierWithGroupSync();
+            // parallel reduction sum
+            if(groupThreadId < 128) sum_vec[groupThreadId] += sum_vec[groupThreadId + 128];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 64) sum_vec[groupThreadId] += sum_vec[groupThreadId + 64];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 32) sum_vec[groupThreadId] +=sum_vec[groupThreadId + 32];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 16) sum_vec[groupThreadId] += sum_vec[groupThreadId + 16];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 8) sum_vec[groupThreadId] += sum_vec[groupThreadId + 8];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 4) sum_vec[groupThreadId] += sum_vec[groupThreadId + 4];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId < 2) sum_vec[groupThreadId] += sum_vec[groupThreadId + 2];
+            GroupMemoryBarrierWithGroupSync();
+            if(groupThreadId == 0) dotV = sum_vec[0] + sum_vec[1];
+            GroupMemoryBarrierWithGroupSync();
+
+            for (uint sub_vector_9 = 0; sub_vector_9 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_9) {
+                int index = INBLOCK_ID(sub_vector_9);
+                int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_9);
+                if (index >= limit - 1) {
+                    out_data[uint2(index_hacked, feature_buffer + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = tmp_data_private_cache[sub_vector_9]
+                                                                - 2.0f * uVec[index] * dotV / u_length_squared;
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+
+    uint tmpId;
+    if(groupThreadId < FEATURES_COUNT) {
+        rmat[groupThreadId][FEATURES_COUNT] = out_data[uint2(groupThreadId, FEATURES_COUNT + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+    } else if((tmpId = groupThreadId - FEATURES_COUNT) < FEATURES_COUNT) {
+        rmat[tmpId][BUFFER_COUNT - 2] = out_data[uint2(tmpId, BUFFER_COUNT - 2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+    } else if((tmpId = tmpId - FEATURES_COUNT) < FEATURES_COUNT) {
+        rmat[tmpId][BUFFER_COUNT - 1] = out_data[uint2(tmpId, BUFFER_COUNT - 1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    
+    // Back substitution
+	limit--;
+    for(int i = BUFFER_COUNT - 4; i >= 0; i--) {
+		if (rmat[limit][i] != 0.0f) {
+			if (groupThreadId < 3) {
+				rmat[i][BUFFER_COUNT - groupThreadId - 1] = rmat[limit][BUFFER_COUNT - groupThreadId - 1] / rmat[limit][i];
+			}
+			limit--;
+		}
+		else {
+			if (groupThreadId < 3) {
+				rmat[i][BUFFER_COUNT - groupThreadId - 1] = 0.0f;
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+        if(groupThreadId < 3 * limit + 3) {
+            uint rowId = limit - groupThreadId / 3;
+            uint channel = BUFFER_COUNT - (groupThreadId % 3) - 1;
+            rmat[rowId][channel] -= rmat[i][channel] * rmat[rowId][i];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+#else
+	for (uint col_2 = 0; col_2 < FEATURES_COUNT; col_2++) {
+		float tmp_sum_value = 0;
+		for (uint sub_vector_10 = 0; sub_vector_10 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_10) {
+			uint index = INBLOCK_ID(sub_vector_10);
+            int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_10);
+			float tmp = out_data[uint2(index_hacked, col_2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+			uVec[index] = tmp;
+			if (index >= col_2 + 1) {
+				tmp_sum_value += tmp * tmp;
+			}
+		}
+		sum_vec[groupThreadId] = tmp_sum_value;
+		GroupMemoryBarrierWithGroupSync();
+
+		// parallel reduction sum
+		if (groupThreadId < 128) sum_vec[groupThreadId] += sum_vec[groupThreadId + 128];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 64) sum_vec[groupThreadId] += sum_vec[groupThreadId + 64];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 32) sum_vec[groupThreadId] += sum_vec[groupThreadId + 32];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 16) sum_vec[groupThreadId] += sum_vec[groupThreadId + 16];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 8) sum_vec[groupThreadId] += sum_vec[groupThreadId + 8];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 4) sum_vec[groupThreadId] += sum_vec[groupThreadId + 4];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 2) sum_vec[groupThreadId] += sum_vec[groupThreadId + 2];
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId == 0) vec_length = sum_vec[0] + sum_vec[1];
+		GroupMemoryBarrierWithGroupSync();
+
+		float r_value;
+		if (groupThreadId < col_2) {
+			r_value = uVec[groupThreadId];
+		}
+		else if (groupThreadId == col_2) {
+			u_length_squared = vec_length;
+			vec_length = sqrt(vec_length + uVec[col_2] * uVec[col_2]);
+			uVec[col_2] -= vec_length;
+			u_length_squared += uVec[col_2] * uVec[col_2];
+			r_value = vec_length;
+		}
+		else if (groupThreadId > col_2) {
+			r_value = 0;
+		}
+
+		if (groupThreadId < FEATURES_COUNT)
+			rmat[groupThreadId][col_2] = r_value;
+
+		for (uint feature_buffer = col_2 + 1; feature_buffer < BUFFER_COUNT; feature_buffer++) {
+			float tmp_data_private_cache[BLOCK_PIXELS / LOCAL_SIZE];
+			float tmp_sum_value = 0.0f;
+			for (uint sub_vector_11 = 0; sub_vector_11 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_11) {
+				uint index = INBLOCK_ID(sub_vector_11);
+                int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_11);
+				if (index >= col_2) {
+					float tmp = out_data[uint2(index_hacked, feature_buffer + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+					if (col_2 == 0 && feature_buffer < FEATURES_COUNT) {
+						tmp = add_random(tmp, groupThreadId, sub_vector_11, feature_buffer, frameNumber);
+					}
+					tmp_data_private_cache[sub_vector_11] = tmp;
+					tmp_sum_value += tmp * uVec[index];
+				}
+			}
+
+			sum_vec[groupThreadId] = tmp_sum_value;
+			GroupMemoryBarrierWithGroupSync();
+			// parallel reduction sum
+			if (groupThreadId < 128) sum_vec[groupThreadId] += sum_vec[groupThreadId + 128];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 64) sum_vec[groupThreadId] += sum_vec[groupThreadId + 64];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 32) sum_vec[groupThreadId] += sum_vec[groupThreadId + 32];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 16) sum_vec[groupThreadId] += sum_vec[groupThreadId + 16];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 8) sum_vec[groupThreadId] += sum_vec[groupThreadId + 8];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 4) sum_vec[groupThreadId] += sum_vec[groupThreadId + 4];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId < 2) sum_vec[groupThreadId] += sum_vec[groupThreadId + 2];
+			GroupMemoryBarrierWithGroupSync();
+			if (groupThreadId == 0) dotV = sum_vec[0] + sum_vec[1];
+			GroupMemoryBarrierWithGroupSync();
+
+			for (uint sub_vector_12 = 0; sub_vector_12 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_12) {
+				uint index = INBLOCK_ID(sub_vector_12);
+                int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_12);
+				if (index >= col_2) {
+					out_data[uint2(index_hacked, feature_buffer + BLOCK_OFFSET_UNITY_TEXTURE_HACK)] = tmp_data_private_cache[sub_vector_12]
+						- 2.0f * uVec[index] * dotV / u_length_squared;
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+		}
+	}
+
+	uint tmpId;
+	if (groupThreadId < FEATURES_COUNT) {
+		rmat[groupThreadId][FEATURES_COUNT] = out_data[uint2(groupThreadId, FEATURES_COUNT + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+	}
+	else if ((tmpId = groupThreadId - FEATURES_COUNT) < FEATURES_COUNT) {
+		rmat[tmpId][BUFFER_COUNT - 2] = out_data[uint2(tmpId, BUFFER_COUNT - 2 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+	}
+	else if ((tmpId = tmpId - FEATURES_COUNT) < FEATURES_COUNT) {
+		rmat[tmpId][BUFFER_COUNT - 1] = out_data[uint2(tmpId, BUFFER_COUNT - 1 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+
+	// Back substitution
+	for (int i = BUFFER_COUNT - 4; i >= 0; i--) {
+		if (groupThreadId < 3) {
+			rmat[i][BUFFER_COUNT - groupThreadId - 1] /= rmat[i][i];
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (groupThreadId < 3 * (uint)i) {
+			uint rowId = i - groupThreadId / 3 - 1;
+			uint channel = BUFFER_COUNT - (groupThreadId % 3) - 1;
+			rmat[rowId][channel] -= rmat[i][channel] * rmat[rowId][i];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+#endif
+	
+    // calculate filtered color
+	for (uint sub_vector_13 = 0; sub_vector_13 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_13) {
+		uint index = INBLOCK_ID(sub_vector_13);
+		uVec[index] = 0.0f;
+		gchannel[index] = 0.0f;
+		bchannel[index] = 0.0f;
+	}
+
+	for (uint col_3 = 0; col_3 < FEATURES_COUNT; col_3++) {
+		for (uint sub_vector_14 = 0; sub_vector_14 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_14) {
+			uint index = INBLOCK_ID(sub_vector_14);
+            int index_hacked = INBLOCK_ID_UNITY_TEXTURE_HACK(sub_vector_14);
+			float tmp = tmp_data[uint2(index_hacked, col_3 + BLOCK_OFFSET_UNITY_TEXTURE_HACK)];
+			uVec[index] += rmat[col_3][FEATURES_COUNT] * tmp;
+			gchannel[index] += rmat[col_3][FEATURES_COUNT + 1] * tmp;
+			bchannel[index] += rmat[col_3][FEATURES_COUNT + 2] * tmp;
+		}
+	}
+
+	for (uint sub_vector_15 = 0; sub_vector_15 < BLOCK_PIXELS / LOCAL_SIZE; ++sub_vector_15) {
+		uint index = INBLOCK_ID(sub_vector_15) ;
+		int2 uv = int2(groupId.x % horizontal_blocks_count, groupId.x / horizontal_blocks_count);
+		uv *= BLOCK_EDGE_LENGTH;
+		uv += int2(index % BLOCK_EDGE_LENGTH, index / BLOCK_EDGE_LENGTH);
+		uv += BLOCK_OFFSETS[frameNumber % BLOCK_OFFSETS_COUNT];
+
+        // TODO: por qué entra en el if
+		if (uv.x < 0 || uv.y < 0 
+        // uv.x >= screen_width || uv.y >= screen_height
+        ) {
+			continue;
+		}
+        if( gInvalidatePrevFrame[uv] == 0){
+            // el pixel no fue invalidado
+            gCurNoisy[uv] = albedo[uv] * float4(uVec[index] < 0.0f ? 0.0f : uVec[index], 
+                                                gchannel[index] < 0.0f ? 0.0f : gchannel[index],
+                                                bchannel[index] < 0.0f ? 0.0f : bchannel[index],
+                                                gCurNoisy[uv].w);
+        }
+	}
+}

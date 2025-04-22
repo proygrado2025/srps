@@ -1,0 +1,139 @@
+#include "UnityShaderVariables.cginc"
+
+#pragma max_recursion_depth 10
+
+// Input
+RaytracingAccelerationStructure g_SceneAccelStruct;
+float g_Zoom; //Mathf.Tan(Mathf.Deg2Rad * Camera.main.fieldOfView * 0.5f)
+TextureCube<float4> g_CubeMap;
+SamplerState sampler_linear_repeat;
+float3 g_sun_direction;
+float3 _debugFloat3;
+float _debugFloat;
+uint frameNumber; // TODO: evaluar is es mejor pasar este valor o directamente un seed usando Random()
+float4x4 _InvCameraViewProj;
+uint g_samplesPerPixel;
+// uint g_samplesPerInvalidatedPixel;
+
+// Output
+RWTexture2D<float4> g_OutputColor;
+RWTexture2D<float4> g_OutputAlbedo;
+RWTexture2D<float4> g_OutputNormal;
+RWTexture2D<float4> g_OutputWorldPos;
+RWTexture2D<uint> g_OutputInvalidatePrevFrame;
+
+#include "RayPayload.hlsl"
+
+#define test_define 1
+// miss shader 1??
+[shader("miss")]
+void MainMissShader(inout RayPayload payload : SV_RayPayload)
+{
+    //integrators.cpp::642 o 404
+	payload.color = payload.energy * g_CubeMap.SampleLevel(sampler_linear_repeat, WorldRayDirection(), 0);
+    if( payload.bounceIndex == 0) {
+        payload.worldPos = float4(WorldRayOrigin()+WorldRayDirection()*100,0); //TODO: revisar
+        payload.worldNormal = float4(-WorldRayDirection(),0);
+        payload.albedo = payload.color;
+    }
+    payload.energy = 0;
+}
+
+// miss shader 0??
+[shader("miss")]
+void MainMissShader2_Shadow(inout RayPayloadShadow payload : SV_RayPayload)
+{
+    // The ray "hit" the light.
+	payload.shadowValue = 1;
+}
+
+float randHalfPixel(float pixelSeed, float2 pixelXY)
+{
+    return frac(sin(pixelSeed / 100.0f * dot(pixelXY, float2(12.9898f, 78.233f))) * 43758.5453f)-.5f;
+}
+
+inline void GenerateCameraRay(out float3 origin, out float3 direction, float seed)
+{
+  // center in the middle of the pixel.
+  uint2 launchIndex = DispatchRaysIndex().xy;
+  float2 xy = launchIndex + float2(0.5f + randHalfPixel(seed+12.9898f, launchIndex),0.5f + randHalfPixel(seed+ 78.233f, launchIndex));
+  float2 screenPos = xy / DispatchRaysDimensions().xy * 2.0f - 1.0f;
+
+  // Un project the pixel coordinate into a ray.
+  float4 world = mul(_InvCameraViewProj, float4(screenPos, 0, 1));
+
+  world.xyz /= world.w;
+  origin = _WorldSpaceCameraPos.xyz;
+  direction = normalize(world.xyz - origin);
+}
+
+[shader("raygeneration")]
+void MainRayGenShader()
+{
+    //TODO: implementar supersampling a nivel de pixel de pantalla
+    // sampler.h::53
+    uint2 launchIndex = DispatchRaysIndex().xy;
+    uint2 launchDim = DispatchRaysDimensions().xy;
+
+    float pixelSeed = launchDim.x+launchDim.y+frameNumber; //uint(launchIndex.x)^uint(launchIndex.y) + launchDim.x; //TODO: evaluar si rinde cambiar la cuenta para obtener un seed por pixel
+
+    float2 frameCoord = float2(launchIndex.x, launchDim.y - launchIndex.y - 1) +float2(0.5f ,0.5f);
+
+    // Rotate the ray from view space to world space.
+    float3 rayDirection;
+    float3 origin;
+
+    RayDesc ray;
+    RayPayload payload;
+
+
+    float4 pixelColor = 0;
+    float4 pixelAlbedo = 0;
+    float4 pixelNormal = 0;
+    float4 pixelWorldPos = 0;
+    uint invalidatePrevFrame = 0;
+    uint iterations = g_samplesPerPixel;
+    float invIterations = 1/(float)iterations;
+    for(uint i = 0; i < iterations; ++i){
+
+        GenerateCameraRay(origin, rayDirection, pixelSeed+i);
+        ray.Origin    = _WorldSpaceCameraPos;
+        ray.Direction = rayDirection;
+        ray.TMin      = 0.0f;
+        ray.TMax      = 1e20f;
+
+        payload.color = float4(0, 0, 0, 0);
+        payload.albedo = float4(0, 0, 0, 0);
+        payload.worldPos = float4(0, 0, 0, 0);
+        payload.worldNormal = float4(0, 0, 0, 0);
+        payload.pixelSeed = pixelSeed+i;
+        payload.pixelXY = launchIndex;
+        payload.bounceIndex = 0;
+        payload.energy = 1;
+        payload.invalidatePrevFrame = 0;
+        payload.hiddenObjectPath = 0;
+
+        uint missShaderIndex = 1;
+        uint hitGroup = 0;
+        uint totalHitGroups = 2;
+        TraceRay(g_SceneAccelStruct, RAY_FLAG_NONE, 0xFF, hitGroup, totalHitGroups, missShaderIndex, ray, payload);
+
+        // // cuando el payload devuelve que hay que invalidar el pixel no hay que lanzar nuevos rayos
+        // if( (i == 0) && payload.invalidatePrevFrame != 0){
+        //     iterations = 1; //g_samplesPerInvalidatedPixel;
+        //     invIterations = 1/(float)iterations;
+        // }
+
+        pixelColor += payload.color * invIterations;
+        pixelAlbedo += payload.albedo * invIterations;
+        pixelNormal += payload.worldNormal * invIterations;
+        pixelWorldPos += payload.worldPos * invIterations;
+        invalidatePrevFrame |= payload.invalidatePrevFrame;
+    }
+    g_OutputColor[frameCoord] = pixelColor;
+    g_OutputAlbedo[frameCoord] = pixelAlbedo;
+    g_OutputNormal[frameCoord] = pixelNormal;
+    g_OutputWorldPos[frameCoord] = pixelWorldPos;
+    g_OutputInvalidatePrevFrame[frameCoord] = invalidatePrevFrame;
+
+}

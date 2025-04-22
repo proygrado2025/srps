@@ -1,0 +1,17 @@
+{
+  "name": "com.render-pipelines.custom",
+  "description": "Custom render pipeline in the context of an engineering degree course.",
+  "version": "0.1.0-preview",
+  "unity": "2020.3",
+  "unityRelease": "7f1",
+  "displayName": "Custom SRP",
+  "dependencies": {
+    "com.unity.render-pipelines.core": "10.4.0"
+  },
+  "keywords": [
+    "graphics",
+    "rendering",
+    "pipeline",
+    "SRP"
+  ]
+}
